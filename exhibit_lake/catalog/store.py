@@ -73,6 +73,18 @@ CREATE TABLE IF NOT EXISTS snapshot_members (
     source_id TEXT NOT NULL, event_id TEXT NOT NULL, payload_hash TEXT NOT NULL,
     PRIMARY KEY(snapshot_id,source_id,event_id)
 );
+CREATE TABLE IF NOT EXISTS publish_groups (
+    group_id TEXT PRIMARY KEY, venue_id TEXT NOT NULL REFERENCES venues(venue_id),
+    status TEXT NOT NULL, created_at TEXT NOT NULL, published_at TEXT
+);
+CREATE TABLE IF NOT EXISTS publish_group_members (
+    group_id TEXT NOT NULL REFERENCES publish_groups(group_id),
+    local_day TEXT NOT NULL, snapshot_id TEXT NOT NULL REFERENCES snapshots(snapshot_id),
+    expected_head TEXT,
+    PRIMARY KEY(group_id,local_day)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_group_member_snapshot ON publish_group_members(snapshot_id);
+CREATE INDEX IF NOT EXISTS ix_group_member_day ON publish_group_members(group_id,local_day);
 CREATE TABLE IF NOT EXISTS audits (
     audit_id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL,
     subject TEXT NOT NULL, detail_json TEXT NOT NULL, at TEXT NOT NULL

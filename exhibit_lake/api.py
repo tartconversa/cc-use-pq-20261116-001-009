@@ -58,6 +58,16 @@ class PublishIn(BaseModel):
     expected_head: str | None = None
 
 
+class GroupStageIn(BaseModel):
+    venue_id: str
+    days: list[str] = Field(min_length=2)
+    expected_heads: dict[str, str | None] | None = None
+
+
+class GroupPublishIn(BaseModel):
+    expected_heads: dict[str, str | None] | None = None
+
+
 class WithdrawIn(BaseModel):
     withdrawn_on: str
 
@@ -145,6 +155,30 @@ def create_app(database: str | None = None) -> FastAPI:
     @app.post("/snapshots/{snapshot_id}/abandon")
     def abandon(snapshot_id: str):
         return lake.snapshots.abandon(snapshot_id)
+
+    @app.post("/publish-groups/stage", status_code=201)
+    def stage_group(data: GroupStageIn):
+        return lake.groups.stage(data.venue_id, data.days, data.expected_heads)
+
+    @app.get("/publish-groups/{group_id}")
+    def describe_group(group_id: str):
+        return lake.groups.describe(group_id)
+
+    @app.post("/publish-groups/{group_id}/publish")
+    def publish_group(group_id: str, data: GroupPublishIn):
+        return lake.groups.publish(group_id, data.expected_heads)
+
+    @app.post("/publish-groups/{group_id}/abandon")
+    def abandon_group(group_id: str):
+        return lake.groups.abandon(group_id)
+
+    @app.get("/publish-groups/{group_id}/report")
+    def group_report(group_id: str):
+        return lake.analytics.group_report(group_id)
+
+    @app.get("/venues/{venue_id}/publish-groups")
+    def list_groups(venue_id: str, local_day: str | None = None):
+        return lake.groups.list(venue_id, local_day)
 
     @app.get("/snapshots/{snapshot_id}/lineage")
     def lineage(snapshot_id: str):

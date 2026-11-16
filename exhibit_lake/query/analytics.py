@@ -6,7 +6,7 @@ from collections import defaultdict
 
 from exhibit_lake.catalog.registry import iso_day
 from exhibit_lake.catalog.store import Store
-from exhibit_lake.errors import InvalidInput, NotFound, StateError
+from exhibit_lake.errors import IntegrityFailure, InvalidInput, NotFound, StateError
 from exhibit_lake.publish.snapshots import Snapshots
 
 
@@ -45,41 +45,69 @@ class Analytics:
     def day(self, venue_id: str, day: str, snapshot_id: str | None = None) -> dict:
         with self.store.transaction(write=False) as conn:
             snapshot = self._resolve(conn, venue_id, day, snapshot_id)
-            records = self._records(conn, snapshot["snapshot_id"])
-            exhibits = {x["exhibit_id"]: x for x in Store.many(conn, "SELECT exhibit_id,name,maker,launched_on,withdrawn_on FROM exhibits WHERE venue_id=?", (venue_id,))}
-            groups = defaultdict(lambda: {"visit_events": 0, "visitors": 0, "feedback_events": 0,
-                                          "rating_sum": 0, "rating_average": None, "demo_events": 0,
-                                          "demo_seconds": 0.0, "feedback_visitors": set(), "channels": defaultdict(int)})
-            for record in records:
-                group = groups[record["exhibit_id"]]
-                if record["kind"] == "visit":
-                    group["visit_events"] += 1
-                    group["visitors"] += int(record["value_num"])
-                elif record["kind"] == "feedback":
-                    group["feedback_events"] += 1
-                    group["rating_sum"] += int(record["value_num"])
-                    group["feedback_visitors"].add(record["visitor_hash"])
-                else:
-                    group["demo_events"] += 1
-                    group["demo_seconds"] += record["value_num"]
-                if record["category"]:
-                    group["channels"][record["category"]] += 1
-            result = []
-            for exhibit_id in sorted(groups):
-                group = groups[exhibit_id]
-                feedback = group["feedback_events"]
-                result.append({"exhibit_id": exhibit_id, "name": exhibits[exhibit_id]["name"],
-                               "maker": exhibits[exhibit_id]["maker"], "visit_events": group["visit_events"],
-                               "visitors": group["visitors"], "feedback_events": feedback,
-                               "unique_feedback_visitors": len(group["feedback_visitors"]),
-                               "rating_average": round(group["rating_sum"] / feedback, 4) if feedback else None,
-                               "demo_events": group["demo_events"], "demo_seconds": round(group["demo_seconds"], 3),
-                               "channels": dict(sorted(group["channels"].items()))})
-            return {"venue_id": venue_id, "local_day": day, "snapshot_id": snapshot["snapshot_id"],
-                    "generation": snapshot["generation"], "event_count": len(records), "exhibits": result,
-                    "total_visitors": sum(x["visitors"] for x in result),
-                    "total_feedback": sum(x["feedback_events"] for x in result),
-                    "total_demos": sum(x["demo_events"] for x in result)}
+            return self._day_report(conn, venue_id, day, snapshot)
+
+    def _day_report(self, conn, venue_id: str, day: str, snapshot: dict) -> dict:
+        records = self._records(conn, snapshot["snapshot_id"])
+        exhibits = {x["exhibit_id"]: x for x in Store.many(conn, "SELECT exhibit_id,name,maker,launched_on,withdrawn_on FROM exhibits WHERE venue_id=?", (venue_id,))}
+        groups = defaultdict(lambda: {"visit_events": 0, "visitors": 0, "feedback_events": 0,
+                                      "rating_sum": 0, "rating_average": None, "demo_events": 0,
+                                      "demo_seconds": 0.0, "feedback_visitors": set(), "channels": defaultdict(int)})
+        for record in records:
+            group = groups[record["exhibit_id"]]
+            if record["kind"] == "visit":
+                group["visit_events"] += 1
+                group["visitors"] += int(record["value_num"])
+            elif record["kind"] == "feedback":
+                group["feedback_events"] += 1
+                group["rating_sum"] += int(record["value_num"])
+                group["feedback_visitors"].add(record["visitor_hash"])
+            else:
+                group["demo_events"] += 1
+                group["demo_seconds"] += record["value_num"]
+            if record["category"]:
+                group["channels"][record["category"]] += 1
+        result = []
+        for exhibit_id in sorted(groups):
+            group = groups[exhibit_id]
+            feedback = group["feedback_events"]
+            result.append({"exhibit_id": exhibit_id, "name": exhibits[exhibit_id]["name"],
+                           "maker": exhibits[exhibit_id]["maker"], "visit_events": group["visit_events"],
+                           "visitors": group["visitors"], "feedback_events": feedback,
+                           "unique_feedback_visitors": len(group["feedback_visitors"]),
+                           "rating_average": round(group["rating_sum"] / feedback, 4) if feedback else None,
+                           "demo_events": group["demo_events"], "demo_seconds": round(group["demo_seconds"], 3),
+                           "channels": dict(sorted(group["channels"].items()))})
+        return {"venue_id": venue_id, "local_day": day, "snapshot_id": snapshot["snapshot_id"],
+                "generation": snapshot["generation"], "event_count": len(records), "exhibits": result,
+                "total_visitors": sum(x["visitors"] for x in result),
+                "total_feedback": sum(x["feedback_events"] for x in result),
+                "total_demos": sum(x["demo_events"] for x in result)}
+
+    def group_report(self, group_id: str) -> dict:
+        with self.store.transaction(write=False) as conn:
+            group = Store.one(conn, "SELECT * FROM publish_groups WHERE group_id=?", (group_id,))
+            if not group:
+                raise NotFound("publish group not found")
+            if group["status"] != "published":
+                raise StateError("publish group is not published")
+            members = Store.many(conn, "SELECT local_day,snapshot_id FROM publish_group_members "
+                                 "WHERE group_id=? ORDER BY local_day", (group_id,))
+        for member in members:
+            self.snapshots.verify(member["snapshot_id"])
+        with self.store.transaction(write=False) as conn:
+            days = []
+            for member in members:
+                snapshot = Store.one(conn, "SELECT * FROM snapshots WHERE snapshot_id=?", (member["snapshot_id"],))
+                if not snapshot or snapshot["status"] != "published":
+                    raise IntegrityFailure("publish group member is not a published snapshot")
+                days.append(self._day_report(conn, group["venue_id"], member["local_day"], snapshot))
+            return {"group_id": group_id, "venue_id": group["venue_id"], "published_at": group["published_at"],
+                    "days": days, "snapshot_ids": [day["snapshot_id"] for day in days],
+                    "event_count": sum(day["event_count"] for day in days),
+                    "total_visitors": sum(day["total_visitors"] for day in days),
+                    "total_feedback": sum(day["total_feedback"] for day in days),
+                    "total_demos": sum(day["total_demos"] for day in days)}
 
     def events(self, venue_id: str, day: str, snapshot_id: str | None = None,
                *, exhibit_id: str | None = None, kind: str | None = None,

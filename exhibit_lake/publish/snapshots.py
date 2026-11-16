@@ -56,38 +56,48 @@ class Snapshots:
     def stage(self, venue_id: str, day: str, expected_head: str | None = None) -> dict:
         iso_day(day, "local_day")
         with self.store.transaction() as conn:
-            part = self._partition(conn, venue_id, day)
-            if part["head_id"] != expected_head:
-                raise Conflict("expected head differs from current partition", details={"head_id": part["head_id"]})
-            events = Store.many(conn, "SELECT source_id,event_id,exhibit_id,event_at,local_day,kind,value_num,category,visitor_hash,payload_hash "
-                               "FROM accepted_events WHERE venue_id=? AND local_day=? ORDER BY source_id,event_id", (venue_id, day))
-            membership = [{"source_id": x["source_id"], "event_id": x["event_id"], "payload_hash": x["payload_hash"]}
-                          for x in events]
-            manifest = {"venue_id": venue_id, "local_day": day, "generation": part["generation"] + 1,
-                        "parent_id": part["head_id"], "members": membership, "statistics": _statistics(events)}
-            checksum = digest(manifest)
-            duplicate = Store.one(conn, "SELECT snapshot_id FROM snapshots WHERE venue_id=? AND local_day=? AND generation=? AND status='staged'",
-                                  (venue_id, day, manifest["generation"]))
-            if duplicate:
-                raise Conflict("candidate already staged for this generation")
-            snapshot_id = uuid.uuid4().hex
-            conn.execute("INSERT INTO snapshots VALUES(?,?,?,?,?,?,?,?,?,?)",
-                         (snapshot_id, venue_id, day, manifest["generation"], part["head_id"], "staged",
-                          json.dumps(manifest, sort_keys=True), checksum, now(), None))
-            conn.executemany("INSERT INTO snapshot_members VALUES(?,?,?,?)",
-                             [(snapshot_id, item["source_id"], item["event_id"], item["payload_hash"]) for item in membership])
-            Store.audit(conn, "snapshot.staged", snapshot_id,
-                        {"venue_id": venue_id, "local_day": day, "members": len(membership)}, now())
+            snapshot_id = self._stage(conn, venue_id, day, expected_head)
             return self._describe(conn, snapshot_id)
+
+    def _stage(self, conn: sqlite3.Connection, venue_id: str, day: str, expected_head: str | None) -> str:
+        part = self._partition(conn, venue_id, day)
+        if part["head_id"] != expected_head:
+            raise Conflict("expected head differs from current partition", details={"head_id": part["head_id"]})
+        events = Store.many(conn, "SELECT source_id,event_id,exhibit_id,event_at,local_day,kind,value_num,category,visitor_hash,payload_hash "
+                            "FROM accepted_events WHERE venue_id=? AND local_day=? ORDER BY source_id,event_id", (venue_id, day))
+        membership = [{"source_id": x["source_id"], "event_id": x["event_id"], "payload_hash": x["payload_hash"]}
+                      for x in events]
+        manifest = {"venue_id": venue_id, "local_day": day, "generation": part["generation"] + 1,
+                    "parent_id": part["head_id"], "members": membership, "statistics": _statistics(events)}
+        checksum = digest(manifest)
+        duplicate = Store.one(conn, "SELECT snapshot_id FROM snapshots WHERE venue_id=? AND local_day=? AND generation=? AND status='staged'",
+                              (venue_id, day, manifest["generation"]))
+        if duplicate:
+            raise Conflict("candidate already staged for this generation")
+        snapshot_id = uuid.uuid4().hex
+        conn.execute("INSERT INTO snapshots VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     (snapshot_id, venue_id, day, manifest["generation"], part["head_id"], "staged",
+                      json.dumps(manifest, sort_keys=True), checksum, now(), None))
+        conn.executemany("INSERT INTO snapshot_members VALUES(?,?,?,?)",
+                         [(snapshot_id, item["source_id"], item["event_id"], item["payload_hash"]) for item in membership])
+        Store.audit(conn, "snapshot.staged", snapshot_id,
+                    {"venue_id": venue_id, "local_day": day, "members": len(membership)}, now())
+        return snapshot_id
 
     def _describe(self, conn: sqlite3.Connection, snapshot_id: str) -> dict:
         snapshot = Store.one(conn, "SELECT * FROM snapshots WHERE snapshot_id=?", (snapshot_id,))
         if not snapshot:
             raise NotFound("snapshot not found")
+        membership = Store.one(conn, "SELECT group_id FROM publish_group_members WHERE snapshot_id=?", (snapshot_id,))
         return {"snapshot_id": snapshot_id, "venue_id": snapshot["venue_id"], "local_day": snapshot["local_day"],
                 "generation": snapshot["generation"], "parent_id": snapshot["parent_id"],
-                "status": snapshot["status"], "digest": snapshot["digest"],
+                "status": snapshot["status"], "digest": snapshot["digest"], "group_id": membership["group_id"] if membership else None,
                 "manifest": json.loads(snapshot["manifest_json"]), "published_at": snapshot["published_at"]}
+
+    def _bound_group(self, conn: sqlite3.Connection, snapshot_id: str) -> str | None:
+        row = Store.one(conn, "SELECT g.group_id FROM publish_group_members m JOIN publish_groups g ON g.group_id=m.group_id "
+                        "WHERE m.snapshot_id=? AND g.status='staged'", (snapshot_id,))
+        return row["group_id"] if row else None
 
     def describe(self, snapshot_id: str) -> dict:
         with self.store.transaction(write=False) as conn:
@@ -138,24 +148,31 @@ class Snapshots:
             part = self._partition(conn, snapshot["venue_id"], snapshot["local_day"])
             if snapshot["status"] == "published" and part["head_id"] == snapshot_id:
                 return self._describe(conn, snapshot_id)
-            if snapshot["status"] != "staged":
-                raise StateError("only staged snapshots can become head")
-            if part["head_id"] != expected_head or snapshot["parent_id"] != expected_head:
-                raise Conflict("head changed since candidate staging", details={"head_id": part["head_id"]})
-            if snapshot["generation"] != part["generation"] + 1:
-                raise Conflict("snapshot generation is stale")
-            stamp = now()
-            result = conn.execute("UPDATE partitions SET head_id=?,generation=? WHERE venue_id=? AND local_day=? AND head_id IS ? AND generation=?",
-                                  (snapshot_id, snapshot["generation"], snapshot["venue_id"], snapshot["local_day"],
-                                   expected_head, part["generation"]))
-            if result.rowcount != 1:
-                raise Conflict("concurrent head update")
-            conn.execute("UPDATE snapshots SET status='published',published_at=? WHERE snapshot_id=?", (stamp, snapshot_id))
-            conn.execute("UPDATE accepted_events SET published_at=COALESCE(published_at,?) WHERE (source_id,event_id) "
-                         "IN (SELECT source_id,event_id FROM snapshot_members WHERE snapshot_id=?)", (stamp, snapshot_id))
-            Store.audit(conn, "snapshot.published", snapshot_id,
-                        {"parent_id": expected_head, "generation": snapshot["generation"]}, stamp)
+            bound = self._bound_group(conn, snapshot_id)
+            if bound:
+                raise StateError("snapshot is bound to a staged publish group",
+                                 details={"group_id": bound})
+            self._apply_publish(conn, snapshot, part, expected_head, now())
             return self._describe(conn, snapshot_id)
+
+    def _apply_publish(self, conn: sqlite3.Connection, snapshot: dict, part: dict,
+                       expected_head: str | None, stamp: str) -> None:
+        if snapshot["status"] != "staged":
+            raise StateError("only staged snapshots can become head")
+        if part["head_id"] != expected_head or snapshot["parent_id"] != expected_head:
+            raise Conflict("head changed since candidate staging", details={"head_id": part["head_id"]})
+        if snapshot["generation"] != part["generation"] + 1:
+            raise Conflict("snapshot generation is stale")
+        result = conn.execute("UPDATE partitions SET head_id=?,generation=? WHERE venue_id=? AND local_day=? AND head_id IS ? AND generation=?",
+                              (snapshot["snapshot_id"], snapshot["generation"], snapshot["venue_id"], snapshot["local_day"],
+                               expected_head, part["generation"]))
+        if result.rowcount != 1:
+            raise Conflict("concurrent head update")
+        conn.execute("UPDATE snapshots SET status='published',published_at=? WHERE snapshot_id=?", (stamp, snapshot["snapshot_id"]))
+        conn.execute("UPDATE accepted_events SET published_at=COALESCE(published_at,?) WHERE (source_id,event_id) "
+                     "IN (SELECT source_id,event_id FROM snapshot_members WHERE snapshot_id=?)", (stamp, snapshot["snapshot_id"]))
+        Store.audit(conn, "snapshot.published", snapshot["snapshot_id"],
+                    {"parent_id": expected_head, "generation": snapshot["generation"]}, stamp)
 
     def abandon(self, snapshot_id: str) -> dict:
         with self.store.transaction() as conn:
@@ -164,6 +181,10 @@ class Snapshots:
                 raise NotFound("snapshot not found")
             if snapshot["status"] != "staged":
                 raise StateError("only staged snapshots can be abandoned")
+            bound = self._bound_group(conn, snapshot_id)
+            if bound:
+                raise StateError("snapshot is bound to a staged publish group",
+                                 details={"group_id": bound})
             conn.execute("UPDATE snapshots SET status='abandoned' WHERE snapshot_id=?", (snapshot_id,))
             Store.audit(conn, "snapshot.abandoned", snapshot_id, {}, now())
             return self._describe(conn, snapshot_id)

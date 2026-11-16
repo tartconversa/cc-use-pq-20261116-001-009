@@ -10,6 +10,15 @@
 
 默认数据库为本地 SQLite 文件；用 EXHIBIT_LAKE_DB 可指定其他路径。
 
+## 多日原子发布
+
+跨自然日的活动（如周末展期）可以把一组日期放进同一个发布组，整组原子生效：
+
+- `POST /publish-groups/stage`：在单个事务内为整组日期暂存候选快照，任一日期与 `expected_heads` 不符或已有同代候选时整组不落地。
+- `POST /publish-groups/{group_id}/publish`：先逐个校验候选，再于单个事务内逐日条件交换 head；任一日期 head 已变化或候选未通过校验时整组回滚，不会部分生效。组内候选在组未决期间不能走单日发布或废弃。
+- `GET /publish-groups/{group_id}/report`：活动报表只引用同一发布组内已发布且通过校验的快照，单日后续重新发布不会改变该组视图。
+- `GET /publish-groups/{group_id}`、`GET /venues/{venue_id}/publish-groups` 与快照描述中的 `group_id` 支持组与快照之间的互相回查；恢复接口会跳过并标注组绑定候选。
+
 ## 测试与构建
 
     python -m unittest discover -s tests -v
